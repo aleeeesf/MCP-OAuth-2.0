@@ -143,7 +143,7 @@ async def call_protected_resource(
         )
 
     response.raise_for_status()
-
+    print(response)
     return response.json()
 
 

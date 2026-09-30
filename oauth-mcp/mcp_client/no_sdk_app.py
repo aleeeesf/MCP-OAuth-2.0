@@ -1,4 +1,3 @@
-import asyncio
 import secrets
 
 from fastapi import FastAPI, Query
@@ -28,7 +27,7 @@ REDIRECT_URI = (
 )
 
 RESOURCE_URL = (
-    "http://localhost:9000/mcp"
+    "http://localhost:9000/mcp/"
 )
 
 PROFILE_URL = (
@@ -36,7 +35,7 @@ PROFILE_URL = (
 )
 
 MCP_ENDPOINT = (
-    "http://localhost:9000/mcp"
+    "http://localhost:9000/mcp/"
 )
 
 oauth_sessions = {}
@@ -154,6 +153,7 @@ async def callback(
 
     del oauth_sessions[state]
 
+    print("*** Access token: "+token["access_token"])
     return {
         "message": "Authorization successful",
         "token_type": token["token_type"],
@@ -175,7 +175,7 @@ async def call_profile():
     )
 @app.get("/mcp-test")
 async def mcp_test():
-
+    print(access_token)
     if access_token is None:
         return {
             "error": "Not authenticated"
