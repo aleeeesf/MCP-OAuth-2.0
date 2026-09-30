@@ -24,7 +24,7 @@ AUTH_SERVER = "http://localhost:8000"
 # Esto es solamente para aprender.
 # Más adelante sustituiremos todo esto por una base de datos.
 #
-clients = {
+mcp_clients = {
     "my-mcp-client": {
         "redirect_uris": [
             "http://localhost:9100/callback"
@@ -33,10 +33,12 @@ clients = {
             "profile"
         ],
         "allowed_resources": [
-            "http://localhost:9000/mcp"
+            "http://localhost:9000/mcp/"
         ],
     },
+}
 
+clients = {
     "mcp-resource-server": {
         "client_secret": "super-secret-development-value",
         "allowed_operations": [
@@ -61,10 +63,8 @@ user_sessions = {}
 
 
 # Authorization codes.
-#
-# Todavía no los utilizamos completamente.
-# Los utilizaremos en el siguiente paso para /token.
-#
+# Códigos de autorización para poder obtener luego el token
+# 
 authorization_codes = {}
 
 access_tokens = {}
@@ -194,9 +194,9 @@ async def authorize(
     # 1. Comprobar que el cliente existe
     # ---------------------------------------------------------------
     
-    client = clients.get(client_id)
+    mcp_client = mcp_clients.get(client_id)
 
-    if client is None:
+    if mcp_client is None:
         raise HTTPException(
             status_code=400,
             detail="Unknown client",
@@ -206,7 +206,7 @@ async def authorize(
     # 2. Comprobar que el cliente puede solicitar tokens al recurso
     # ---------------------------------------------------------------
 
-    if resource not in client.get("allowed_resources", []):
+    if resource not in mcp_client.get("allowed_resources", []):
         raise HTTPException(
             status_code=400,
             detail="Client is not allowed to request this resource",
@@ -219,7 +219,7 @@ async def authorize(
     requested_scopes = scope.split()
 
     for requested_scope in requested_scopes:
-        if requested_scope not in client["allowed_scopes"]:
+        if requested_scope not in mcp_client["allowed_scopes"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"Scope not allowed: {requested_scope}",
@@ -229,7 +229,7 @@ async def authorize(
     # 3. Comprobar que la redirect_uri está registrada
     # ---------------------------------------------------------------
 
-    if redirect_uri not in client["redirect_uris"]:
+    if redirect_uri not in mcp_client["redirect_uris"]:
         raise HTTPException(
             status_code=400,
             detail="Invalid redirect_uri",
