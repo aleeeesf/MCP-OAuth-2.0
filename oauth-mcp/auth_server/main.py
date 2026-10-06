@@ -1,23 +1,38 @@
-# Servidor Oauth simple. A modo de ejemplo para entender el flujo
-# oauth. Sin buenas prácticas de código.
+"""
+Un pequeño servidor de autorización OAuth que opera en memoria. Diseñado con fines educativos.
 
+Los registros y las credenciales de demostración se almacenan deliberadamente en memoria. 
+Para facilitar la exploración del flujo de código de autorización de OAuth. No adecuado para un entorno de producción.
+"""
+
+import hmac
 import base64
-import secrets
 import hashlib
-
+import secrets
+from typing import Annotated
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Cookie
-from fastapi import FastAPI, Form, HTTPException, Header
+from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 #                           SERVIDOR FASTAPI
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="OAuth Authorization Server")
+basic_security = HTTPBasic(auto_error=False)
+
+# ---------------------------------------------------------------------------
+#                           CONFIGURACIÓN
+# ---------------------------------------------------------------------------
 
 AUTH_SERVER = "http://localhost:8000"
+USER_EMAIL = "juan@example.com"
+USER_PASSWORD = "password"
+USER_ID = "user-123"
 
 # ---------------------------------------------------------------------------
 #                           DATOS TEMPORALES
@@ -28,7 +43,7 @@ AUTH_SERVER = "http://localhost:8000"
 
 
 # Clientes MCPs permitidos para solicitar el bearer
-mcp_clients = {
+MCP_CLIENTS = {
     "my-mcp-client": {
         "redirect_uris": [
             "http://localhost:9100/callback"
@@ -43,7 +58,7 @@ mcp_clients = {
 }
 
 # Servidores MCP registrados para acceder a los recursos protegidos
-servers_clients = {
+RESOURCE_SERVER_CLIENTS = {
     "mcp-resource-server": {
         "client_secret": "super-secret-development-value",
         "allowed_operations": [
@@ -52,153 +67,184 @@ servers_clients = {
     },
 }
 
+
+# ---------------------------------------------------------------------------
+#                                   MODELOS
+# ---------------------------------------------------------------------------
+
+class OAuthRequest(BaseModel):
+    client_id: str
+    redirect_uri: str
+    scope: str
+    state: str
+    code_challenge: str
+    code_challenge_method: str
+    resource: str
+
+
+class UserSession(BaseModel):
+    user_id: str
+    email: str
+
+
+class AuthorizationCode(BaseModel):
+    client_id: str
+    user_id: str
+    redirect_uri: str
+    scope: str
+    code_challenge: str
+    code_challenge_method: str
+    resource: str
+    expires_at: datetime
+    used: bool = False
+
+
+class AccessToken(BaseModel):
+    user_id: str
+    client_id: str
+    scope: str
+    resource: str
+    expires_at: datetime
+
+
+class RootResponse(BaseModel):
+    message: str
+
+
+class AuthorizationServerMetadata(BaseModel):
+    issuer: str
+    authorization_endpoint: str
+    token_endpoint: str
+    introspection_endpoint: str
+    response_types_supported: list[str]
+    grant_types_supported: list[str]
+    code_challenge_methods_supported: list[str]
+    scopes_supported: list[str]
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "Bearer"
+    scope: str
+    resource: str
+    expires_at: datetime
+
+
+class InactiveTokenResponse(BaseModel):
+    active: bool = False
+
+
+class ActiveTokenResponse(BaseModel):
+    active: bool = True
+    client_id: str
+    user_id: str
+    scope: str
+    resource: str
+    exp: int
+    iss: str
+
+
+# ---------------------------------------------------------------------------
+#                          ALMACENAMIENTO DEMO
+# ---------------------------------------------------------------------------
+
 # Solicitudes OAuth pendientes.
 #
 # session_id -> datos de la solicitud OAuth
 #
-oauth_requests = {}
+oauth_requests: dict[str, OAuthRequest] = {}
 
 
 # Sesiones de usuarios autenticados.
 #
 # user_session_id -> datos del usuario
 #
-user_sessions = {}
+user_sessions: dict[str, UserSession] = {}
 
 
 # Authorization codes.
 #
 # Códigos de autorización para poder obtener luego el token
 # 
-authorization_codes = {}
+authorization_codes: dict[str, AuthorizationCode] = {}
 
 # Tokens de autenticación
 #
 # Bearer tokens para solicitar peticiones protegidas
 # 
-access_tokens = {}
+access_tokens: dict[str, AccessToken] = {}
 
 
+# ---------------------------------------------------------------------------
+#                            HELPERS
+# ---------------------------------------------------------------------------
 
-def authenticate_client(
-    authorization: str | None = Header(default=None)
-):
-    """
-    Permite comprobar que el header de autenticación de una request
-    es correcta y que el cliente está autorizado.
-    
-    Args:
-        authorization (str | None): Header de autenticación de una request
-
-    Returns:
-        None
-
-    Raises:
-        - Si no hay header de autenticación
-        - Si el header es incorrecto
-        - Si las credenciales del cliente son incorrectas
-        - Si el cliente no existe
-
-    """
-
-    # No hay header de autenticación
-    if authorization is None:
+def get_resource_server_client(
+    credentials: Annotated[
+        HTTPBasicCredentials | None,
+        Depends(basic_security),
+    ],) -> str:
+    """Authenticate an introspection caller and return its client ID."""
+    if credentials is None:
         raise HTTPException(
-            status_code=401,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Client authentication required",
+            headers={"WWW-Authenticate": "Basic"},
         )
 
-    # Separar Bearer <token>
-    try:
-        scheme, encoded_credentials = authorization.split(
-            " ",
-            1,
-        )
-    except ValueError:
+    client = RESOURCE_SERVER_CLIENTS.get(credentials.username)
+    if client is None or not hmac.compare_digest(
+        credentials.password,
+        client["client_secret"],
+    ):
         raise HTTPException(
-            status_code=401,
-            detail="Invalid Authorization header",
-        )
-
-    if scheme.lower() != "basic":
-        raise HTTPException(
-            status_code=401,
-            detail="Unsupported authentication scheme",
-        )
-
-    # Split del client_id:client_secret
-    try:
-        decoded = base64.b64decode(
-            encoded_credentials
-        ).decode("utf-8")
-
-        client_id, client_secret = decoded.split(
-            ":",
-            1,
-        )
-    except (ValueError, UnicodeDecodeError):
-        raise HTTPException(
-            status_code=401,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid client credentials",
+            headers={"WWW-Authenticate": "Basic"},
         )
 
-    # Obtener cliente de la base de datos
-    client = servers_clients.get(client_id)
-
-    if client is None:
+    if "introspection" not in client["allowed_operations"]:
         raise HTTPException(
-            status_code=401,
-            detail="Invalid client",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Client is not allowed to introspect tokens",
         )
+    return credentials.username
 
-    if client.get("client_secret") != client_secret:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid client credentials",
-        )
-
-    return client_id
-
+def require_oauth_request(session_id: str) -> OAuthRequest:
+    oauth_request = oauth_requests.get(session_id)
+    if oauth_request is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth session")
+    return oauth_request
 
 # ---------------------------------------------------------------------------
 #                            RUTAS API
 # ---------------------------------------------------------------------------
 
 # ----------- Root -----------
-@app.get("/")
-async def root():
-    return {
-        "message": "OAuth Authorization Server"
-    }
+@app.get("/", response_model=RootResponse)
+async def root() -> RootResponse:
+    return RootResponse(message="OAuth Authorization Server")
 
 # ----------- Información de este Auth Server -----------
-@app.get("/.well-known/oauth-authorization-server")
-async def authorization_server_metadata():
-
-    return {
-        "issuer": AUTH_SERVER,
-        "authorization_endpoint": (
-            f"{AUTH_SERVER}/authorize"
-        ),
-        "token_endpoint": (
-            f"{AUTH_SERVER}/token"
-        ),
-        "introspection_endpoint": (
-            f"{AUTH_SERVER}/introspect"
-        ),
-        "response_types_supported": [
-            "code"
-        ],
-        "grant_types_supported": [
-            "authorization_code"
-        ],
-        "code_challenge_methods_supported": [
-            "S256"
-        ],
-        "scopes_supported": [
-            "profile"
-        ],
-    }
+@app.get(
+    "/.well-known/oauth-authorization-server",
+    response_model=AuthorizationServerMetadata,
+)
+async def authorization_server_metadata() -> AuthorizationServerMetadata:
+    return AuthorizationServerMetadata(
+        issuer=AUTH_SERVER,
+        authorization_endpoint=f"{AUTH_SERVER}/authorize",
+        token_endpoint=f"{AUTH_SERVER}/token",
+        introspection_endpoint=f"{AUTH_SERVER}/introspect",
+        response_types_supported=["code"],
+        grant_types_supported=["authorization_code"],
+        code_challenge_methods_supported=["S256"],
+        scopes_supported=sorted({
+            scope
+            for client in MCP_CLIENTS.values()
+            for scope in client["allowed_scopes"]
+        }),
+    )
 
 
 # -----------  OAuth Authorization Endpoint. -----------
@@ -211,169 +257,108 @@ async def authorize(
     state: str,
     code_challenge: str,
     code_challenge_method: str,
-    resource: str
-):
+    resource: str,
+) -> RedirectResponse:
     # 1. Comprobar que el cliente existe
-    mcp_client = mcp_clients.get(client_id)
+    mcp_client = MCP_CLIENTS.get(client_id)
 
     if mcp_client is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Unknown client",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown client")
 
-    # 2. Comprobar que el cliente puede solicitar tokens al recurso que solicta
+    # 2. Comprobar que el tipo de respuesta es válido
+    if response_type != "code":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported response_type")
+
+    # 3. Comprobar que el cliente puede solicitar tokens al recurso que solicta
     if resource not in mcp_client.get("allowed_resources", []):
-        raise HTTPException(
-            status_code=400,
-            detail="Client is not allowed to request this resource",
-        )
-
-    # 3. Comprobar que tiene permiso para los scopes que solicita
-    requested_scopes = scope.split()
-
-    for requested_scope in requested_scopes:
-        if requested_scope not in mcp_client["allowed_scopes"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Scope not allowed: {requested_scope}",
-            )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client is not allowed to request this resource")
 
     # 4. Comprobar que la redirect_uri está registrada
     if redirect_uri not in mcp_client["redirect_uris"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid redirect_uri",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid redirect_uri")
 
-    # 5. Guardar la solicitud OAuth
+    # 5. Comprobar que el método está soportado
+    if code_challenge_method.upper() != "S256":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported code_challenge_method")
+
+    # 6. Comprobar que incluye code_challenge
+    if not code_challenge:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="code_challenge is required")
+
+    # 7. Comprobar que solicita al menos un scope
+    requested_scopes = set(scope.split())
+    if not requested_scopes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one scope is required")
+
+    # 8. Comprobar que tiene permiso para los scopes que solicita
+    disallowed_scopes = requested_scopes - set(mcp_client["allowed_scopes"])
+    if disallowed_scopes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Scope not allowed: {', '.join(sorted(disallowed_scopes))}")
+
+    # 9. Guardar la solicitud OAuth
     #
     # Creamos un identificador aleatorio para relacionar
     # esta solicitud OAuth con el proceso de login.
     session_id = secrets.token_urlsafe(32)
-    print(f"Session ID: {str.upper(code_challenge_method)}")
+    print(f"Session ID: {session_id}")
 
-    oauth_requests[session_id] = {
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "scope": scope,
-        "state": state,
-        "code_challenge": code_challenge,
-        "code_challenge_method": str.upper(code_challenge_method),
-        "resource": resource
-    }
+    oauth_requests[session_id] = OAuthRequest(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        scope=" ".join(sorted(requested_scopes)),
+        state=state,
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
+        resource=resource,
+    )
 
-    # 6. Enviar al usuario al login
+    # 10. Enviar al usuario al login
     return RedirectResponse(
         url=f"/login?session_id={session_id}",
-        status_code=303,
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
 # ----------- Login Page -----------
 @app.get("/login", response_class=HTMLResponse)
-async def login_page(session_id: str):
+async def login_page(session_id: str) -> HTMLResponse:
     
     # Comprobamos que la solicitud OAuth exista.
-    if session_id not in oauth_requests:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid OAuth session",
-        )
-
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Login</title>
-    </head>
-
-    <body>
+    require_oauth_request(session_id)
+    
+    return HTMLResponse(f"""
+        <!doctype html>
+        <html><head><title>Login</title></head><body>
         <h1>Login</h1>
-
         <form method="post" action="/login">
-
-            <input
-                type="hidden"
-                name="session_id"
-                value="{session_id}"
-            >
-
-            <div>
-                <label>
-                    Email:
-                    <input
-                        name="email"
-                        type="email"
-                        required
-                    >
-                </label>
-            </div>
-
-            <br>
-
-            <div>
-                <label>
-                    Password:
-                    <input
-                        name="password"
-                        type="password"
-                        required
-                    >
-                </label>
-            </div>
-
-            <br>
-
-            <button type="submit">
-                Login
-            </button>
-
-        </form>
-    </body>
-    </html>
-    """
+        <input type="hidden" name="session_id" value="{session_id}">
+        <label>Email: <input name="email" type="email" required></label><br><br>
+        <label>Password: <input name="password" type="password" required></label><br><br>
+        <button type="submit">Login</button>
+        </form></body></html>
+    """)
 
 # -----------  Login -----------
 @app.post("/login")
 async def login(
-    session_id: str = Form(...),
-    email: str = Form(...),
-    password: str = Form(...),
-):
+    session_id: Annotated[str, Form()],
+    email: Annotated[str, Form()],
+    password: Annotated[str, Form()],
+) -> RedirectResponse:
     
     # 1. Recuperar la solicitud OAuth abierta del /authorize
-    oauth_request = oauth_requests.get(session_id)
-
-    if oauth_request is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid OAuth session",
-        )
+    require_oauth_request(session_id)
 
     # ! 2. AUTENTICACIÓN TEMPORAL
-    if email != "juan@example.com":
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid credentials",
-        )
-
-    if password != "password":
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid credentials",
-        )
+    if email != USER_EMAIL or password != USER_PASSWORD:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     # 3. Crear sesión de usuario
     # El usuario nos ha enviado su email y contraseña,
     # almacenamos en cache y enviamos cookie para identificarlo
     # después en el consent
     user_session_id = secrets.token_urlsafe(32)
-
-    user_sessions[user_session_id] = {
-        "user_id": "user-123",
-        "email": email,
-    }
+    user_sessions[user_session_id] = UserSession(user_id=USER_ID, email=email)
 
     # 4. Ir a la pantalla de consentimiento
     response = RedirectResponse(
@@ -383,7 +368,7 @@ async def login(
 
     # 5. Guardar la sesión del usuario en una cookie
     response.set_cookie(
-        key="session",
+        key="user_session_id",
         value=user_session_id,
         httponly=True,
         secure=False,  #! En producción con HTTPS será True
@@ -395,307 +380,199 @@ async def login(
 
 # ----------- Página de consentimiento -----------
 @app.get("/consent", response_class=HTMLResponse)
-async def consent_page(session_id: str):
+async def consent_page(session_id: str) -> HTMLResponse:
+
+    def html_escape(value: str) -> str:
+        """Valores de escape insertados en las pequeñas páginas HTML escritas a mano"""
+        from html import escape
+        return escape(value, quote=True)
 
     # 1. Recuperar solicitud OAuth
-    oauth_request = oauth_requests.get(session_id)
-
-    if oauth_request is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid OAuth session",
-        )
+    oauth_request = require_oauth_request(session_id)
 
     # 2. Mostrar consentimiento
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Authorization</title>
-    </head>
+    client_name = html_escape(oauth_request.client_id)
+    requested_scope = html_escape(oauth_request.scope)
 
-    <body>
+    return HTMLResponse(f"""
+        <!doctype html>
+        <html><head><title>Authorization</title></head><body>
         <h1>Authorization required</h1>
-
-        <p>
-            The application
-            <strong>{oauth_request["client_id"]}</strong>
-            wants access to:
-        </p>
-
-        <ul>
-            <li>{oauth_request["scope"]}</li>
-        </ul>
-
+        <p>The application <strong>{client_name}</strong> wants access to:</p>
+        <ul><li>{requested_scope}</li></ul>
         <form method="post" action="/consent">
-
-            <input
-                type="hidden"
-                name="session_id"
-                value="{session_id}"
-            >
-
-            <button
-                type="submit"
-                name="decision"
-                value="deny"
-            >
-                Deny
-            </button>
-
-            <button
-                type="submit"
-                name="decision"
-                value="allow"
-            >
-                Allow
-            </button>
-
-        </form>
-    </body>
-    </html>
-    """
+        <input type="hidden" name="session_id" value="{html_escape(session_id)}">
+        <button type="submit" name="decision" value="deny">Deny</button>
+        <button type="submit" name="decision" value="allow">Allow</button>
+        </form></body></html>"""
+    )
 
 
 # -----------  Decisión del consentimiento -----------
 @app.post("/consent")
 async def consent(
-    session_id: str = Form(...),
-    decision: str = Form(...),
-    session: str | None = Cookie(default=None),
-):
-    # 1. Asegurar que es una request abierta
-    oauth_request = oauth_requests.get(session_id)
+    session_id: Annotated[str, Form()],
+    decision: Annotated[str, Form()],
+    user_session_id: Annotated[str | None, Cookie(alias="user_session_id")] = None,
+) -> RedirectResponse:
 
-    if oauth_request is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid OAuth session",
+    def authorization_redirect(
+        redirect_uri: str,
+        **parameters: str,
+    ) -> RedirectResponse:
+        return RedirectResponse(
+            url=f"{redirect_uri}?{urlencode(parameters)}",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
+    
+    # 1. Asegurar que es una request abierta
+    oauth_request = require_oauth_request(session_id)
 
     # 2. Buscar la información del usuario que consiente
-    user_session = user_sessions.get(session)
+    user_session = user_sessions.get(user_session_id)
 
     if user_session is None:
-        raise HTTPException(
-            status_code=401,
-            detail="User is not authenticated",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User is not authenticated")
 
     # 3. Obtener la decisión del usuario
     if decision == "deny":
-        redirect_uri = oauth_request["redirect_uri"]
-        state = oauth_request["state"]
-
-        redirect_url = (
-            f"{redirect_uri}"
-            f"?error=access_denied"
-            f"&state={state}"
-        )
-
-        return RedirectResponse(
-            url=redirect_url,
-            status_code=303,
+        oauth_requests.pop(session_id, None)
+        return authorization_redirect(
+            oauth_request.redirect_uri,
+            error="access_denied",
+            state=oauth_request.state,
+            iss=AUTH_SERVER
         )
 
     if decision != "allow":
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid consent decision",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid consent decision")
 
     # 4. Generar el code con el que se obtendrá el token
     code = secrets.token_urlsafe(32)
     print(f"Code: {code}")
 
-    # 5. Añadir tiempo de expiración. Caduca la petición a los 5 minutos
-    expires_at = (
-        datetime.now(timezone.utc)
-        + timedelta(minutes=5)
+    # 5. Generar el modelo de autenticación. Código de expiración de 5 minutos
+    authorization_codes[code] = AuthorizationCode(
+        client_id=oauth_request.client_id,
+        user_id=user_session.user_id,
+        redirect_uri=oauth_request.redirect_uri,
+        scope=oauth_request.scope,
+        code_challenge=oauth_request.code_challenge,
+        code_challenge_method=oauth_request.code_challenge_method,
+        resource=oauth_request.resource,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
     )
-
-    authorization_codes[code] = {
-        "client_id": oauth_request["client_id"],
-        "user_id": user_session["user_id"],
-        "redirect_uri": oauth_request["redirect_uri"],
-        "scope": oauth_request["scope"],
-        "code_challenge": oauth_request["code_challenge"],
-        "code_challenge_method": (
-            oauth_request["code_challenge_method"]
-        ),
-        "resource": oauth_request["resource"],
-        "expires_at": expires_at,
-        "used": False,
-    }
-
-    redirect_uri = oauth_request["redirect_uri"]
-    state = oauth_request["state"]
-
-    redirect_url = (
-        f"{redirect_uri}"
-        f"?code={code}"
-        f"&state={state}"
-    )
-
-    # Redirigimos al callback del cliente que recibirá el 
-    # código con el que después nos enviará el token
-    return RedirectResponse(
-        url=redirect_url,
-        status_code=303,
+    oauth_requests.pop(session_id, None)
+    return authorization_redirect(
+        oauth_request.redirect_uri,
+        code=code,
+        state=oauth_request.state,
+        iss=AUTH_SERVER
     )
 
 # -----------  Obtener Bearer Token  -----------
-@app.post("/token")
+@app.post("/token", response_model=TokenResponse)
 async def token(
-    grant_type: str = Form(...),
-    code: str = Form(...),
-    client_id: str = Form(...),
-    redirect_uri: str = Form(...),
-    code_verifier: str = Form(...),
-    resource: str = Form(...)
-):
-    # 1. Grant type
-    if grant_type != "authorization_code":
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported grant_type",
-        )
+    grant_type: Annotated[str, Form()],
+    code: Annotated[str, Form()],
+    client_id: Annotated[str, Form()],
+    redirect_uri: Annotated[str, Form()],
+    code_verifier: Annotated[str, Form()],
+    resource: Annotated[str, Form()],
+) -> TokenResponse:
 
-    # 2. Buscar authorization code
+    # 1. Buscar authorization code
     authorization = authorization_codes.get(code)
+    
     if authorization is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid authorization code",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid authorization code")
+    
+    # 2. Grant type
+    if grant_type != "authorization_code":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported grant_type")
 
     # 3. Comprobar uso único
-    if authorization["used"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Authorization code already used",
-        )
+    if authorization.used:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Authorization code already used")
 
     # 4. Comprobar expiración
-    if datetime.now(timezone.utc) >= authorization["expires_at"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Authorization code expired",
-        )
+    if datetime.now(timezone.utc) >= authorization.expires_at:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Authorization code expired")
 
     # 5. Comprobar que es del resource server permitido
-    if authorization["resource"] != resource:
-        raise HTTPException(
-            status_code=400,
-            detail="Resource mismatch",
-        )
+    if authorization.resource != resource:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Resource mismatch")
 
     # 6. Comprobar client_id
-    if authorization["client_id"] != client_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Client mismatch",
-        )
+    if authorization.client_id != client_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client mismatch")
 
     # 7. Comprobar redirect_uri
-    if authorization["redirect_uri"] != redirect_uri:
-        raise HTTPException(
-            status_code=400,
-            detail="Redirect URI mismatch",
-        )
+    if authorization.redirect_uri != redirect_uri:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect URI mismatch")
 
     # 8. Comprobar PKCE method
-    if authorization["code_challenge_method"] != "S256":
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported code_challenge_method",
-        )
+    if authorization.code_challenge_method != "S256":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported code_challenge_method")
 
     # 9. Calcular challenge a partir del verifier
-    digest = hashlib.sha256(
-        code_verifier.encode("ascii")
-    ).digest()
-
-    calculated_challenge = (
-        base64.urlsafe_b64encode(digest)
-        .rstrip(b"=")
-        .decode("ascii")
-    )
+    try:
+        verifier_bytes = code_verifier.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid code_verifier") from exc
+    
+    digest = hashlib.sha256(verifier_bytes).digest()
+    calculated_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
     # 10. Comparar PKCE
-    if calculated_challenge != authorization["code_challenge"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid code_verifier",
-        )
+    if not hmac.compare_digest(calculated_challenge, authorization.code_challenge):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid code_verifier")
 
-    # 11. Marcar code como utilizado
-    authorization["used"] = True
+    # 11. Marcar como usado
+    authorization.used = True 
 
-    # 12. Crear access token
+    # 12. Generar access token
     access_token = secrets.token_urlsafe(32)
-
-    # 13. Añadir expiración al token
-    expires_at = (
-        datetime.now(timezone.utc)
-        + timedelta(hours=2)
+    token_record = AccessToken(
+        user_id=authorization.user_id,
+        client_id=authorization.client_id,
+        scope=authorization.scope,
+        resource=authorization.resource,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
     )
 
-    access_tokens[access_token] = {
-        "user_id": authorization["user_id"],
-        "client_id": authorization["client_id"],
-        "scope": authorization["scope"],
-        "resource": authorization["resource"],
-        "expires_at": expires_at
-    }
+    # 13. Guardar y devolver token
+    access_tokens[access_token] = token_record
 
-    # 14. Responder
-    return {
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "scope": access_tokens[access_token]["scope"],
-        "resource": access_tokens[access_token]["resource"],
-        "expires_at": access_tokens[access_token]["expires_at"]
-    }
+    return TokenResponse(
+        access_token=access_token,
+        scope=token_record.scope,
+        resource=token_record.resource,
+        expires_at=token_record.expires_at,
+    )
 
 
 # -----------  Inspeccionar Token  -----------
-@app.post("/introspect")
+@app.post(
+    "/introspect",
+    response_model=ActiveTokenResponse | InactiveTokenResponse,
+)
 async def introspect(
-    token: str = Form(...),
-    authorization: str | None = Header(default=None),
-):
-    # Identificar al usuario
-    client_id = authenticate_client(authorization)
-
-    # ! Verificar que sea de un recurso permitido
-    # Por ahora hardcodeado
-    if client_id != "mcp-resource-server":
-        raise HTTPException(
-            status_code=403,
-            detail="Client is not allowed to introspect tokens",
-        )
+    token: Annotated[str, Form()],
+    # Se ejecuta la validación HTTP Basic. Si falla, lanza 401/403.
+    # Si pasa, la variable 'authenticated_rs' simplemente confirma quién hizo la llamada.
+    authenticated_rs: Annotated[str, Depends(get_resource_server_client)],
+) -> ActiveTokenResponse | InactiveTokenResponse:
 
     access_token = access_tokens.get(token)
+    if access_token is None or datetime.now(timezone.utc) >= access_token.expires_at:
+        return InactiveTokenResponse()
 
-    if access_token is None:
-        return {
-            "active": False
-        }
-
-    # Verficar que no haya expirado
-    if datetime.now(timezone.utc) >= access_token["expires_at"]:
-        return {
-            "active": False
-        }
-
-    return {
-        "active": True,
-        "client_id": access_token["client_id"],
-        "user_id": access_token["user_id"],
-        "scope": access_token["scope"],
-        "resource": access_token["resource"],
-        "exp": int(
-            access_token["expires_at"].timestamp()
-        ),
-    }
+    return ActiveTokenResponse(
+        client_id=access_token.client_id,  # <-- 'my-mcp-client' (el dueño del token)
+        user_id=access_token.user_id,
+        scope=access_token.scope,
+        resource=access_token.resource,
+        exp=int(access_token.expires_at.timestamp()),
+        iss=AUTH_SERVER
+    )
