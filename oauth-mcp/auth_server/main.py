@@ -46,7 +46,8 @@ USER_ID = "user-123"
 MCP_CLIENTS = {
     "my-mcp-client": {
         "redirect_uris": [
-            "http://localhost:9100/callback"
+            "http://localhost:9100/callback",
+            "http://127.0.0.1:6274/oauth/callback"
         ],
         "allowed_scopes": [
             "profile"
@@ -275,6 +276,7 @@ async def authorize(
 
     # 4. Comprobar que la redirect_uri está registrada
     if redirect_uri not in mcp_client["redirect_uris"]:
+        print(mcp_client["redirect_uris"])
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid redirect_uri")
 
     # 5. Comprobar que el método está soportado
