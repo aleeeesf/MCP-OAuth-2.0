@@ -13,8 +13,8 @@ dependencies = [
     "uvicorn>=0.52.3",
 ]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest",
     "ruff",
 ]
