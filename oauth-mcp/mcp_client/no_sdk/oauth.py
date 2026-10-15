@@ -45,13 +45,13 @@ class AuthorizationServerMetadata(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    """Respuesta del endpoint de emisión de tokens."""
+    """Respuesta del endpoint de emisión de tokens según RFC 6749."""
 
     access_token: str
     token_type: str = "Bearer"
     scope: str = ""
     resource: str | None = None
-    expires_at: str | None = None # es un datetime
+    expires_in: int | None = None  # Tiempo de vida en segundos
 
 
 # ---------------------------------------------------------------------------

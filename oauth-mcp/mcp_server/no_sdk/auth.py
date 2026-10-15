@@ -6,6 +6,7 @@ mediante el endpoint de introspección (RFC 7662) y verifica los permisos (scope
 y recursos asociados. Diseñado con fines educativos.
 """
 
+from datetime import UTC, datetime
 from typing import Annotated
 
 import httpx
@@ -104,11 +105,22 @@ async def get_current_token_info(
     # 2. Introspección del token en el Servidor de Autorización
     token_info = await introspect_token(credentials.credentials)
 
-    # 3. Comprobar si el token está activo
+    # 3. Comprobar si el token está activo y vigente (RFC 7662)
     if not token_info.active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired access token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Comprobación de validez temporal mediante el timestamp 'exp'
+    if (
+        token_info.exp is not None
+        and int(datetime.now(UTC).timestamp()) >= token_info.exp
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access token has expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
 

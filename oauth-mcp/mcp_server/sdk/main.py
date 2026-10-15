@@ -7,16 +7,17 @@ Bearer token contra el servidor de autorización (RFC 7662) comprobando validez,
 recurso de destino y permisos de ámbito (scopes). Diseñado con fines educativos.
 """
 
-import httpx
-from pydantic import BaseModel
-from fastapi import FastAPI, status
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
-from .server import mcp
-
+import httpx
+from fastapi import FastAPI, status
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+
+from .server import mcp
 
 # ---------------------------------------------------------------------------
 #                           CONFIGURACIÓN
@@ -62,15 +63,17 @@ class TokenIntrospection(BaseModel):
 #                               HELPERS
 # ---------------------------------------------------------------------------
 
+
 async def introspect_token(token: str) -> TokenIntrospection:
     """
     Consulta al servidor de autorización la validez y metadatos de un Bearer token.
     Utiliza HTTP Basic con las credenciales registradas del Resource Server.
     """
-    global http_client
     if http_client is None:
-        raise RuntimeError("El cliente HTTP global no ha sido inicializado en el lifespan")
-        
+        raise RuntimeError(
+            "El cliente HTTP global no ha sido inicializado en el lifespan"
+        )
+
     try:
         response = await http_client.post(
             f"{AUTH_SERVER}/introspect",
@@ -82,7 +85,7 @@ async def introspect_token(token: str) -> TokenIntrospection:
         )
         response.raise_for_status()
         return TokenIntrospection(**response.json())
-        
+
     except httpx.HTTPStatusError as e:
         # Si el servidor OAuth responde con un 400 (ej. token malformado o revocado explícitamente),
         # el token es efectivamente inactivo.
@@ -92,7 +95,10 @@ async def introspect_token(token: str) -> TokenIntrospection:
         raise
     except httpx.HTTPError as e:
         # Errores de red, timeouts o caída total del servidor de autorización
-        raise RuntimeError(f"Error de comunicación con el servidor de autorización: {e}")
+        raise RuntimeError(
+            f"Error de comunicación con el servidor de autorización: {e}"
+        )
+
 
 # ---------------------------------------------------------------------------
 #                         LIFESPAN DE LA APLICACIÓN
@@ -107,10 +113,10 @@ async def lifespan(app: FastAPI):
     global http_client
     # Inicializamos el cliente al arrancar la app (con soporte de keep-alive)
     http_client = httpx.AsyncClient(timeout=5.0)
-    
+
     async with mcp.session_manager.run():
         yield
-        
+
     # Cerramos el cliente al apagar la app
     await http_client.aclose()
 
@@ -194,7 +200,10 @@ class OAuthMiddleware(BaseHTTPMiddleware):
 
         if scheme.lower() != "bearer" or not token.strip():
             return JSONResponse(
-                {"error": "unauthorized", "message": "Unsupported authentication scheme"},
+                {
+                    "error": "unauthorized",
+                    "message": "Unsupported authentication scheme",
+                },
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 headers={"WWW-Authenticate": "Bearer"},
             )
@@ -209,12 +218,25 @@ class OAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+        if (
+            token_info.exp is not None
+            and int(datetime.now(UTC).timestamp()) >= token_info.exp
+        ):
+            return JSONResponse(
+                {"error": "unauthorized", "message": "Access token expired"},
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
         # 4. Validar recurso de destino
         token_resource = (token_info.resource or "").rstrip("/")
         expected_resource = MCP_RESOURCE.rstrip("/")
         if token_resource != expected_resource:
             return JSONResponse(
-                {"error": "unauthorized", "message": "Token was not issued for this resource"},
+                {
+                    "error": "unauthorized",
+                    "message": "Token was not issued for this resource",
+                },
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 headers={"WWW-Authenticate": "Bearer"},
             )
@@ -222,7 +244,10 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         # 5. Validar scopes requeridos
         if "profile" not in token_info.scope.split():
             return JSONResponse(
-                {"error": "forbidden", "message": "Insufficient scope: requires 'profile'"},
+                {
+                    "error": "forbidden",
+                    "message": "Insufficient scope: requires 'profile'",
+                },
                 status_code=status.HTTP_403_FORBIDDEN,
             )
 

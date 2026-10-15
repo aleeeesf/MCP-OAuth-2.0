@@ -9,7 +9,7 @@ Diseñado con fines educativos.
 """
 
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query, status
@@ -17,7 +17,6 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from .oauth import (
-    TokenResponse,
     AuthorizationServerMetadata,
     build_authorization_url,
     call_mcp,
@@ -68,7 +67,7 @@ class TokenCallbackResponse(BaseModel):
     message: str
     token_type: str
     scope: str
-    expires_at: str | None = None # es un datetime
+    expires_in: int | None = None
 
 
 class ProfileResponse(BaseModel):
@@ -82,6 +81,21 @@ class McpTestResponse(BaseModel):
     call: dict[str, Any]
 
 
+class StoredToken(BaseModel):
+    access_token: str
+    token_type: str = "Bearer"
+    scope: str = ""
+    resource: str | None = None
+    expires_in: int | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @property
+    def is_expired(self) -> bool:
+        if self.expires_in is None:
+            return False
+        return datetime.now(UTC) >= self.created_at + timedelta(seconds=self.expires_in)
+
+
 # ---------------------------------------------------------------------------
 #                          ALMACENAMIENTO DEMO
 # ---------------------------------------------------------------------------
@@ -91,7 +105,7 @@ class McpTestResponse(BaseModel):
 oauth_sessions: dict[str, OAuthClientSession] = {}
 
 # Último Bearer token obtenido (almacenado en memoria para la demostración).
-stored_token: TokenResponse | None = None
+stored_token: StoredToken | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +113,17 @@ stored_token: TokenResponse | None = None
 # ---------------------------------------------------------------------------
 
 
-def get_authenticated_token() -> TokenResponse:
-    """Valida que exista un token de acceso guardado en memoria."""
+def get_authenticated_token() -> StoredToken:
+    """Valida que exista un token de acceso guardado en memoria y que no haya expirado."""
     if stored_token is None or not stored_token.access_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Client is not authenticated. Please visit /login first.",
+        )
+    if stored_token.is_expired:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access token has expired. Please visit /login again.",
         )
     return stored_token
 
@@ -142,7 +161,9 @@ async def login() -> RedirectResponse:
 
     # 2. Obtener metadatos del servidor de autorización (RFC 8414)
     auth_server_url = resource_metadata.authorization_servers[0]
-    auth_metadata: AuthorizationServerMetadata = await get_authorization_server_metadata(auth_server_url)
+    auth_metadata: AuthorizationServerMetadata = (
+        await get_authorization_server_metadata(auth_server_url)
+    )
 
     # 3. Generar parámetros PKCE y state anti-CSRF
     code_verifier = generate_code_verifier()
@@ -215,14 +236,21 @@ async def callback(
     )
 
     # 4. Almacenar el token en memoria
-    stored_token = token_data
+    stored_token = StoredToken(
+        access_token=token_data.access_token,
+        token_type=token_data.token_type,
+        scope=token_data.scope,
+        resource=token_data.resource,
+        expires_in=token_data.expires_in,
+        created_at=datetime.now(UTC),
+    )
 
     # 5. Devolver confirmación al usuario
     return TokenCallbackResponse(
         message="Authorization successful",
         token_type=token_data.token_type,
         scope=token_data.scope,
-        expires_at=str(token_data.expires_at) if token_data.expires_at else None,
+        expires_in=token_data.expires_in,
     )
 
 
